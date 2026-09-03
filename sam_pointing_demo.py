@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import math
 import os
@@ -7,6 +8,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -158,6 +160,97 @@ class RealSenseCamera:
         color = np.asanyarray(color_frame.get_data())
         depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * self.depth_scale
         return color, depth_m
+
+    def stop(self) -> None:
+        self.pipeline.stop()
+
+
+class RealSenseBag:
+    """Finite RealSense bag source with the same aligned RGB-D output as the camera."""
+
+    def __init__(self, bag_path: str | Path) -> None:
+        self.path = Path(bag_path).expanduser().resolve()
+        self.pipeline = rs.pipeline()
+        self.align = rs.align(rs.stream.color)
+        self.playback: Any | None = None
+        self.depth_scale = 0.001
+        self.intrinsics: rs.intrinsics | None = None
+        self.width = 0
+        self.height = 0
+        self.fps = 30
+        self.last_timestamp_s: float | None = None
+        self._finished = False
+
+    def start(self) -> None:
+        if not self.path.is_file():
+            raise FileNotFoundError(f"RealSense bag not found: {self.path}")
+
+        config = rs.config()
+        config.enable_device_from_file(str(self.path), repeat_playback=False)
+        profile = self.pipeline.start(config)
+        self.playback = profile.get_device().as_playback()
+        # Rendering is driven by inference speed, not wall-clock playback speed.
+        self.playback.set_real_time(False)
+
+        try:
+            depth_sensor = profile.get_device().first_depth_sensor()
+            self.depth_scale = depth_sensor.get_depth_scale()
+        except Exception as exc:
+            raise RuntimeError("The bag does not contain a usable RealSense depth stream") from exc
+
+        try:
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            self.intrinsics = color_profile.get_intrinsics()
+            self.width = color_profile.width()
+            self.height = color_profile.height()
+            self.fps = max(1, int(color_profile.fps()))
+        except Exception as exc:
+            raise RuntimeError("The bag does not contain a usable RealSense color stream") from exc
+
+    def read(self) -> tuple[np.ndarray, np.ndarray] | None:
+        if self._finished or self.is_finished():
+            self._finished = True
+            return None
+
+        try:
+            frames = self.pipeline.wait_for_frames(5_000)
+        except RuntimeError:
+            if self.is_finished():
+                self._finished = True
+                return None
+            raise
+
+        aligned = self.align.process(frames)
+        color_frame = aligned.get_color_frame()
+        depth_frame = aligned.get_depth_frame()
+        if not color_frame or not depth_frame:
+            if self.is_finished():
+                self._finished = True
+                return None
+            raise RuntimeError("bag frame is missing aligned RealSense color or depth data")
+
+        color = self.color_to_bgr(color_frame)
+        depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * self.depth_scale
+        self.last_timestamp_s = float(color_frame.get_timestamp()) / 1_000.0
+        return color, depth_m
+
+    def color_to_bgr(self, color_frame: Any) -> np.ndarray:
+        color = np.asanyarray(color_frame.get_data())
+        color_format = color_frame.profile.format()
+        if color_format == rs.format.bgr8:
+            return color
+        if color_format == rs.format.rgb8:
+            return cv2.cvtColor(color, cv2.COLOR_RGB2BGR)
+        if color_format == rs.format.bgra8:
+            return cv2.cvtColor(color, cv2.COLOR_BGRA2BGR)
+        if color_format == rs.format.rgba8:
+            return cv2.cvtColor(color, cv2.COLOR_RGBA2BGR)
+        if color_format == rs.format.yuyv:
+            return cv2.cvtColor(color, cv2.COLOR_YUV2BGR_YUY2)
+        raise RuntimeError(f"unsupported bag color format: {color_format}")
+
+    def is_finished(self) -> bool:
+        return self.playback is not None and self.playback.current_status() == rs.playback_status.stopped
 
     def stop(self) -> None:
         self.pipeline.stop()
@@ -1711,6 +1804,173 @@ def worker(state: SharedState) -> None:
             pass
 
 
+def default_bag_output_path(bag_path: Path) -> Path:
+    return bag_path.with_name(f"{bag_path.stem}_pointing_sam.mp4")
+
+
+def open_mp4_writer(output_path: Path, width: int, height: int, fps: int, codec: str) -> cv2.VideoWriter:
+    codec = codec.strip()
+    if len(codec) != 4:
+        raise ValueError(f"MP4 codec must be a four-character code, got {codec!r}")
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*codec),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"could not open MP4 output {output_path} with codec {codec!r}; "
+            "try --codec avc1 or --codec mp4v"
+        )
+    return writer
+
+
+def render_rosbag(
+    bag_path: str | Path,
+    output_path: str | Path | None = None,
+    *,
+    overwrite: bool = False,
+    output_fps: int = 0,
+    codec: str = "mp4v",
+) -> Path:
+    """Render a finite RealSense recording through the live pointing/SAM pipeline."""
+    source = RealSenseBag(bag_path)
+    resolved_bag_path = source.path
+    target = Path(output_path).expanduser().resolve() if output_path else default_bag_output_path(resolved_bag_path)
+    if target.suffix.lower() != ".mp4":
+        raise ValueError(f"output must be an .mp4 file, got {target}")
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"output already exists: {target} (use --overwrite to replace it)")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    pointing: PointingEstimator | None = None
+    segmenter = SAMPointSegmenter()
+    hit_estimator = PointHitEstimator()
+    writer: cv2.VideoWriter | None = None
+    last_result: SegmentationResult | None = None
+    last_prompt_pixel: tuple[int, int] | None = None
+    last_prompt_source = ""
+    last_sam_time_s: float | None = None
+    first_timestamp_s: float | None = None
+    frame_count = 0
+
+    try:
+        print(f"[bag] opening {resolved_bag_path}")
+        source.start()
+        if source.intrinsics is None:
+            raise RuntimeError("RealSense bag color intrinsics unavailable")
+
+        print("[bag] loading hand tracker")
+        pointing = PointingEstimator()
+        print("[bag] loading SAM")
+        segmenter.load()
+        fps = output_fps if output_fps > 0 else source.fps
+        print(f"[bag] rendering {source.width}x{source.height} at {fps} fps to {target}")
+
+        while True:
+            frame_start = time.perf_counter()
+            frame = source.read()
+            if frame is None:
+                break
+            color, depth = frame
+
+            if writer is None:
+                writer = open_mp4_writer(target, color.shape[1], color.shape[0], fps, codec)
+            elif (color.shape[1], color.shape[0]) != (source.width, source.height):
+                raise RuntimeError("bag color resolution changed during playback; MP4 output requires a fixed resolution")
+
+            if source.last_timestamp_s is not None:
+                if first_timestamp_s is None:
+                    first_timestamp_s = source.last_timestamp_s
+                video_time_s = max(0.0, source.last_timestamp_s - first_timestamp_s)
+            else:
+                video_time_s = frame_count / float(fps)
+
+            start = time.perf_counter()
+            ray = pointing.estimate(color, depth, source.intrinsics)
+            hand_ms = (time.perf_counter() - start) * 1000.0
+
+            start = time.perf_counter()
+            if ray is not None:
+                prompt = hit_estimator.estimate(ray, depth, source.intrinsics)
+            else:
+                hit_estimator.reset_smoothing()
+                prompt = None
+            hit_ms = (time.perf_counter() - start) * 1000.0
+
+            if prompt is None:
+                last_result = None
+                last_prompt_pixel = None
+                last_prompt_source = ""
+                last_sam_time_s = None
+            else:
+                prompt_jump_px = 0.0
+                if last_prompt_pixel is not None:
+                    prompt_jump_px = math.hypot(
+                        prompt.pixel[0] - last_prompt_pixel[0],
+                        prompt.pixel[1] - last_prompt_pixel[1],
+                    )
+                if prompt.source != last_prompt_source or prompt_jump_px > env_float("SAM_RESET_PROMPT_JUMP_PX", 90.0):
+                    last_result = None
+                    last_sam_time_s = None
+                last_prompt_pixel = prompt.pixel
+                last_prompt_source = prompt.source
+
+            sam_ms = 0.0
+            sam_allowed = prompt is not None and (
+                prompt.source != "ray_projected" or env_bool("SAM_ON_PROJECTED_PROMPT", False)
+            )
+            sam_interval_s = max(0.1, env_float("SAM_INTERVAL_S", 0.75))
+            interval_due = last_sam_time_s is None or video_time_s - last_sam_time_s >= sam_interval_s
+            if sam_allowed and prompt is not None and interval_due:
+                try:
+                    result = segmenter.predict(color, prompt)
+                    segmenter.load_error = ""
+                    last_result = result
+                    sam_ms = result.elapsed_ms if result is not None else 0.0
+                except Exception as exc:
+                    segmenter.load_error = str(exc)
+                    last_result = None
+                last_sam_time_s = video_time_s
+            elif not sam_allowed:
+                last_result = None
+                last_sam_time_s = None
+
+            total_ms = (time.perf_counter() - frame_start) * 1000.0
+            fps_actual = 1000.0 / total_ms if total_ms > 0.0 else 0.0
+            if ray is None:
+                status = "ray=no point=no mask=no"
+            elif prompt is None:
+                status = "ray=yes point=no mask=no"
+            else:
+                status = f"ray=yes point={prompt.pixel} mask={'yes' if last_result is not None else 'no'}"
+            if segmenter.load_error:
+                status = f"SAM error: {segmenter.load_error[:120]}"
+
+            overlay = draw_overlay(color, ray, prompt, last_result, status)
+            writer.write(overlay)
+            frame_count += 1
+
+            if frame_count % 100 == 0:
+                print(
+                    f"[bag] rendered {frame_count} frames "
+                    f"({fps_actual:.1f} processing fps, hand={hand_ms:.1f}ms, hit={hit_ms:.1f}ms, SAM={sam_ms:.1f}ms)"
+                )
+    finally:
+        if writer is not None:
+            writer.release()
+        try:
+            source.stop()
+        except Exception:
+            pass
+
+    if frame_count == 0:
+        raise RuntimeError(f"no RGB-D frames were read from {resolved_bag_path}")
+    print(f"[bag] complete: {frame_count} frames written to {target}")
+    return target
+
+
 app = FastAPI()
 state = SharedState()
 
@@ -1795,5 +2055,46 @@ def stream() -> StreamingResponse:
     return StreamingResponse(stream_frames(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
-if __name__ == "__main__":
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the live RealSense pointing demo or render a RealSense .bag recording to MP4."
+    )
+    parser.add_argument("bag_path", nargs="?", help="RealSense .bag recording to render")
+    parser.add_argument("--bag", dest="bag_option", help="RealSense .bag recording to render")
+    parser.add_argument("--output", help="MP4 output path (defaults beside the bag)")
+    parser.add_argument("--overwrite", action="store_true", help="replace an existing MP4 output")
+    parser.add_argument("--fps", type=int, default=0, help="output FPS; defaults to the recorded color stream FPS")
+    parser.add_argument(
+        "--codec",
+        default=os.getenv("BAG_VIDEO_CODEC", "mp4v"),
+        help="four-character OpenCV MP4 codec (default: mp4v)",
+    )
+    args = parser.parse_args(argv)
+    if args.bag_path and args.bag_option:
+        parser.error("provide the bag either positionally or with --bag, not both")
+    args.bag = args.bag_option or args.bag_path
+    if (args.output or args.overwrite or args.fps or args.codec != os.getenv("BAG_VIDEO_CODEC", "mp4v")) and not args.bag:
+        parser.error("--output, --overwrite, --fps, and --codec require a bag path")
+    if args.fps < 0:
+        parser.error("--fps must be positive")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.bag:
+        render_rosbag(
+            args.bag,
+            args.output or os.getenv("BAG_OUTPUT_PATH") or None,
+            overwrite=args.overwrite or env_bool("BAG_OVERWRITE", False),
+            output_fps=args.fps,
+            codec=args.codec,
+        )
+        return 0
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

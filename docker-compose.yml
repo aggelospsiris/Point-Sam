@@ -121,3 +121,27 @@ services:
     devices:
       - /dev/bus/usb:/dev/bus/usb
     command: python -m sam_pointing_demo
+
+  sam-pointing-video:
+    extends:
+      service: sam-pointing-demo
+    container_name: realsense-sam-pointing-video
+    profiles:
+      - video
+    # Bag playback does not need a physical camera or privileged USB access.
+    privileged: false
+    devices: !reset []
+    ports: !reset []
+    environment:
+      BAG_OVERWRITE: ${BAG_OVERWRITE:-0}
+      BAG_VIDEO_CODEC: ${BAG_VIDEO_CODEC:-mp4v}
+    volumes:
+      - ${ROSBAG_DIR:-.}:/recording
+    command:
+      - python
+      - -m
+      - sam_pointing_demo
+      - --bag
+      - ${ROSBAG_PATH:-/recording/recording.bag}
+      - --output
+      - ${VIDEO_OUTPUT:-/recording/recording_pointing_sam.mp4}
