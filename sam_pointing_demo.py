@@ -17,7 +17,7 @@ import pyrealsense2 as rs
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from frame_transport import MAX_FRAME_BYTES, ReceivedFrame, decode_frame
 
@@ -2101,45 +2101,154 @@ async def upload_frame(request: Request) -> dict[str, object]:
     return {"accepted": True, "camera_id": frame.camera_id}
 
 
+@app.get("/logo/cvlogo.jpeg")
+def logo() -> FileResponse:
+    logo_path = Path(__file__).resolve().parent / "logo" / "cvlogo.jpeg"
+    if not logo_path.is_file():
+        raise HTTPException(status_code=404, detail="logo unavailable")
+    return FileResponse(logo_path, media_type="image/jpeg")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return """
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <title>RealSense SAM Pointing</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>RealSense Pointing | HUA Computer Vision</title>
     <style>
-      body { margin: 0; font-family: system-ui, sans-serif; background: #101114; color: #f5f5f5; }
-      main { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
-      header { display: flex; align-items: center; gap: 14px; padding: 12px 16px; background: #1b1d22; }
-      h1 { margin: 0; font-size: 16px; font-weight: 650; }
-      .status { margin-left: auto; opacity: .78; font-size: 14px; }
-      img { width: 100%; height: calc(100vh - 49px); object-fit: contain; background: #050505; }
+      :root {
+        color-scheme: light;
+        --rail: min(4vw, 56px);
+        --navy: #0b1450;
+        --blue: #118ad0;
+        --ink: #152044;
+        --muted: #63718d;
+        --line: #e5ebf4;
+      }
+      * { box-sizing: border-box; }
+      html { min-height: 100%; background: var(--navy); }
+      body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--ink); }
+      .shell { min-height: 100vh; margin-inline: var(--rail); background: #fff; }
+      .topbar {
+        display: flex; align-items: center; justify-content: space-between; gap: 20px;
+        padding: 18px clamp(20px, 3.3vw, 54px);
+        border-bottom: 1px solid var(--line);
+      }
+      .brand { display: flex; align-items: center; gap: 16px; min-width: 0; }
+      .brand-logo { width: 64px; height: 64px; border-radius: 50%; object-fit: cover; flex: none; }
+      .brand-name { margin: 0; font-size: clamp(18px, 1.45vw, 24px); font-weight: 750; letter-spacing: -.035em; line-height: 1.15; }
+      .brand-caption { margin: 5px 0 0; color: var(--muted); font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+      .connection {
+        display: inline-flex; align-items: center; gap: 9px; flex: none;
+        padding: 10px 15px; border: 1px solid #dce9f7; border-radius: 999px;
+        background: #f4f9ff; color: #315777; font-size: 13px; font-weight: 700;
+      }
+      .connection-dot { width: 8px; height: 8px; border-radius: 50%; background: #92a7bd; }
+      .connection.live .connection-dot { background: #19a882; box-shadow: 0 0 0 4px #dff7ef; }
+      .connection.error .connection-dot { background: #d85b69; box-shadow: 0 0 0 4px #ffe9ec; }
+      main { padding: 27px clamp(20px, 3.3vw, 54px) 32px; }
+      .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+      .section-heading h2 { margin: 0; font-size: 20px; font-weight: 720; letter-spacing: -.025em; }
+      .section-heading p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+      .eyebrow { color: var(--blue); font-size: 11px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+      .viewer { overflow: hidden; border: 1px solid #dce5f0; border-radius: 16px; background: #09152d; box-shadow: 0 12px 38px rgba(18, 50, 105, .08); }
+      .viewer img { display: block; width: 100%; height: clamp(360px, calc(100vh - 275px), 900px); object-fit: contain; background: #09152d; }
+      .details { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 17px 2px 0; }
+      .detail-status { min-width: 0; overflow: hidden; color: var(--muted); font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+      .metrics { display: flex; align-items: center; gap: clamp(16px, 2.5vw, 38px); flex: none; }
+      .metric { display: flex; align-items: baseline; gap: 7px; white-space: nowrap; }
+      .metric-label { color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+      .metric-value { color: var(--ink); font-size: 13px; font-weight: 700; }
+      @media (max-width: 760px) {
+        :root { --rail: min(3vw, 18px); }
+        .topbar { padding-block: 13px; }
+        .brand-logo { width: 48px; height: 48px; }
+        .brand-caption { font-size: 10px; }
+        .connection { padding: 8px 10px; font-size: 11px; }
+        main { padding-top: 22px; }
+        .viewer img { height: auto; min-height: 220px; aspect-ratio: 16 / 9; }
+        .details { flex-direction: column; align-items: stretch; gap: 12px; }
+        .metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; gap: 10px 18px; }
+        .metric { min-width: 0; }
+        .metric:first-child { grid-column: 1 / -1; }
+      }
+      @media (max-width: 460px) {
+        .topbar { flex-wrap: wrap; }
+        .connection { margin-left: 64px; }
+        .section-heading h2 { font-size: 18px; }
+      }
     </style>
   </head>
   <body>
-    <main>
-      <header>
-        <h1>RealSense SAM Pointing</h1>
-        <div id="status" class="status">starting</div>
+    <div class="shell">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-logo" src="/logo/cvlogo.jpeg" alt="HUA Computer Vision Group logo" />
+          <div>
+            <h1 class="brand-name">RealSense Pointing</h1>
+            <p class="brand-caption">HUA Computer Vision Group</p>
+          </div>
+        </div>
+        <div id="connection" class="connection waiting">
+          <span class="connection-dot" aria-hidden="true"></span>
+          <span id="connection-label">Connecting</span>
+        </div>
       </header>
-      <img src="/stream" />
-      <script>
-        async function refreshStatus() {
-          try {
-            const response = await fetch('/status', { cache: 'no-store' });
-            const data = await response.json();
-            const metrics = data.metrics || {};
-            document.getElementById('status').textContent =
-              data.status + (metrics.camera_id ? ' | camera ' + metrics.camera_id : '') + ' | ' + (metrics.fps || 0) + ' fps | ' + (metrics.sam_ms || 0) + 'ms SAM';
-          } catch (error) {
-            document.getElementById('status').textContent = 'status unavailable';
-          }
+      <main>
+        <div class="section-heading">
+          <div>
+            <span class="eyebrow">Live workspace</span>
+            <h2>Camera view</h2>
+            <p>Pointing detection and SAM segmentation</p>
+          </div>
+        </div>
+        <div class="viewer">
+          <img id="video-feed" src="/stream" alt="Live RealSense pointing and segmentation stream" />
+        </div>
+        <div class="details">
+          <div id="detail-status" class="detail-status">Waiting for the first frame</div>
+          <div class="metrics" aria-label="Stream metrics">
+            <div class="metric"><span class="metric-label">Camera</span><span id="camera" class="metric-value">—</span></div>
+            <div class="metric"><span class="metric-label">FPS</span><span id="fps" class="metric-value">0.0</span></div>
+            <div class="metric"><span class="metric-label">SAM</span><span id="sam" class="metric-value">0 ms</span></div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <script>
+      const connection = document.getElementById('connection');
+      const connectionLabel = document.getElementById('connection-label');
+      const detailStatus = document.getElementById('detail-status');
+      async function refreshStatus() {
+        try {
+          const response = await fetch('/status', { cache: 'no-store' });
+          if (!response.ok) throw new Error('Status unavailable');
+          const data = await response.json();
+          const metrics = data.metrics || {};
+          const status = String(data.status || 'Waiting for frames');
+          const failed = status.startsWith('error:') || status.startsWith('SAM error:');
+          const live = status.startsWith('ray=');
+          connection.className = 'connection ' + (failed ? 'error' : live ? 'live' : 'waiting');
+          connectionLabel.textContent = failed ? 'Needs attention' : live ? 'Live' : 'Waiting';
+          detailStatus.textContent = status;
+          document.getElementById('camera').textContent = metrics.camera_id || '—';
+          document.getElementById('fps').textContent = Number(metrics.fps || 0).toFixed(1);
+          document.getElementById('sam').textContent = Math.round(Number(metrics.sam_ms || 0)) + ' ms';
+        } catch (error) {
+          connection.className = 'connection error';
+          connectionLabel.textContent = 'Disconnected';
+          detailStatus.textContent = 'Status unavailable';
         }
-        setInterval(refreshStatus, 750);
-        refreshStatus();
-      </script>
-    </main>
+      }
+      document.getElementById('video-feed').addEventListener('error', function () {
+        window.setTimeout(() => { this.src = '/stream?retry=' + Date.now(); }, 2000);
+      });
+      window.setInterval(refreshStatus, 1000);
+      refreshStatus();
+    </script>
   </body>
 </html>
 """
