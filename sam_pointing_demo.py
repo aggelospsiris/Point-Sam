@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import math
 import os
@@ -13,8 +14,11 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+
+from frame_transport import MAX_FRAME_BYTES, ReceivedFrame, decode_frame
 
 
 def env_float(name: str, default: float) -> float:
@@ -161,6 +165,49 @@ class RealSenseCamera:
 
     def stop(self) -> None:
         self.pipeline.stop()
+
+
+class RemoteFrameSource:
+    """Keep only the newest uploaded frame while inference is processing."""
+
+    def __init__(self) -> None:
+        self.condition = threading.Condition()
+        self.pending: ReceivedFrame | None = None
+        self.running = True
+
+    def submit(self, frame: ReceivedFrame) -> None:
+        with self.condition:
+            self.pending = frame
+            self.condition.notify()
+
+    def read(self) -> ReceivedFrame | None:
+        with self.condition:
+            if self.pending is None and self.running:
+                self.condition.wait(timeout=1.0)
+            frame = self.pending
+            self.pending = None
+            return frame
+
+    def stop(self) -> None:
+        with self.condition:
+            self.running = False
+            self.condition.notify_all()
+
+
+def realsense_intrinsics(values: dict[str, object]) -> rs.intrinsics:
+    intrinsics = rs.intrinsics()
+    intrinsics.width = int(values["width"])
+    intrinsics.height = int(values["height"])
+    intrinsics.fx = float(values["fx"])
+    intrinsics.fy = float(values["fy"])
+    intrinsics.ppx = float(values["ppx"])
+    intrinsics.ppy = float(values["ppy"])
+    model = str(values["model"])
+    if model not in {"none", "brown_conrady", "modified_brown_conrady", "inverse_brown_conrady", "ftheta", "kannala_brandt4"}:
+        raise ValueError(f"unsupported distortion model: {model}")
+    intrinsics.model = getattr(rs.distortion, model)
+    intrinsics.coeffs = list(values["coeffs"])
+    return intrinsics
 
 
 class PointingEstimator:
@@ -1581,7 +1628,7 @@ def blank_frame(message: str, width: int = 960, height: int = 540) -> np.ndarray
 
 
 def worker(state: SharedState) -> None:
-    camera = RealSenseCamera()
+    camera = remote_source if api_mode else RealSenseCamera()
     pointing: PointingEstimator | None = None
     hit_estimator = PointHitEstimator()
     segmenter = SAMPointSegmenter()
@@ -1590,13 +1637,17 @@ def worker(state: SharedState) -> None:
     last_prompt_pixel: tuple[int, int] | None = None
     last_prompt_source = ""
     last_sam_submit_time = 0.0
+    last_camera_id: str | None = None
     frame_count = 0
 
     try:
-        state.set_frame(blank_frame("Starting RealSense..."), "starting RealSense")
-        camera.start()
-        if camera.intrinsics is None:
-            raise RuntimeError("RealSense color intrinsics unavailable")
+        if api_mode:
+            state.set_frame(blank_frame("Waiting for remote RealSense..."), "waiting for remote RealSense")
+        else:
+            state.set_frame(blank_frame("Starting RealSense..."), "starting RealSense")
+            camera.start()
+            if camera.intrinsics is None:
+                raise RuntimeError("RealSense color intrinsics unavailable")
 
         state.set_frame(blank_frame("Loading hand tracker..."), "loading hand tracker")
         pointing = PointingEstimator()
@@ -1609,16 +1660,47 @@ def worker(state: SharedState) -> None:
             frame_start = time.perf_counter()
 
             start = time.perf_counter()
-            color, depth = camera.read()
+            if api_mode:
+                received = camera.read()
+                if received is None:
+                    async_segmenter.clear()
+                    pointing.reset_smoothing()
+                    hit_estimator.reset_smoothing()
+                    last_result = None
+                    last_prompt_pixel = None
+                    last_prompt_source = ""
+                    last_sam_submit_time = 0.0
+                    state.set_frame(
+                        blank_frame("Waiting for remote RealSense frames..."),
+                        "waiting for remote RealSense frames",
+                        {"fps": 0.0, "sam_ms": 0.0},
+                    )
+                    continue
+                color, depth = received.color, received.depth_m
+                intrinsics = realsense_intrinsics(received.intrinsics)
+                camera_id = received.camera_id
+                if last_camera_id is not None and last_camera_id != camera_id:
+                    async_segmenter.clear()
+                    pointing.reset_smoothing()
+                    hit_estimator.reset_smoothing()
+                    last_result = None
+                    last_prompt_pixel = None
+                    last_prompt_source = ""
+                    last_sam_submit_time = 0.0
+                last_camera_id = camera_id
+            else:
+                color, depth = camera.read()
+                intrinsics = camera.intrinsics
+                camera_id = "local"
             read_ms = (time.perf_counter() - start) * 1000.0
 
             start = time.perf_counter()
-            ray = pointing.estimate(color, depth, camera.intrinsics)
+            ray = pointing.estimate(color, depth, intrinsics)
             hand_ms = (time.perf_counter() - start) * 1000.0
 
             start = time.perf_counter()
             if ray is not None:
-                prompt = hit_estimator.estimate(ray, depth, camera.intrinsics)
+                prompt = hit_estimator.estimate(ray, depth, intrinsics)
             else:
                 hit_estimator.reset_smoothing()
                 prompt = None
@@ -1678,6 +1760,7 @@ def worker(state: SharedState) -> None:
             overlay = draw_overlay(color, ray, prompt, last_result, status)
             metrics: dict[str, float | int | str] = {
                 "frame": frame_count,
+                "camera_id": camera_id,
                 "fps": round(fps, 2),
                 "total_ms": round(total_ms, 1),
                 "read_ms": round(read_ms, 1),
@@ -1713,6 +1796,9 @@ def worker(state: SharedState) -> None:
 
 app = FastAPI()
 state = SharedState()
+remote_source = RemoteFrameSource()
+api_mode = False
+expected_camera_id: str | None = None
 
 
 @app.on_event("startup")
@@ -1724,6 +1810,35 @@ def start_worker() -> None:
 @app.on_event("shutdown")
 def stop_worker() -> None:
     state.running = False
+    remote_source.stop()
+
+
+@app.post("/api/frames", status_code=202)
+async def upload_frame(request: Request) -> dict[str, object]:
+    if not api_mode:
+        raise HTTPException(status_code=404, detail="start the server with --api to accept frames")
+    if request.headers.get("content-type", "").split(";")[0] != "application/octet-stream":
+        raise HTTPException(status_code=415, detail="expected application/octet-stream")
+    try:
+        content_length = int(request.headers.get("content-length", "0") or "0")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid Content-Length") from exc
+    if content_length < 0 or content_length > MAX_FRAME_BYTES:
+        raise HTTPException(status_code=413, detail="frame is too large")
+    chunks = bytearray()
+    async for chunk in request.stream():
+        chunks.extend(chunk)
+        if len(chunks) > MAX_FRAME_BYTES:
+            raise HTTPException(status_code=413, detail="frame is too large")
+    try:
+        frame = await run_in_threadpool(decode_frame, bytes(chunks))
+        if expected_camera_id is not None and frame.camera_id != expected_camera_id:
+            raise HTTPException(status_code=409, detail="camera ID does not match --camera-id")
+        realsense_intrinsics(frame.intrinsics)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    remote_source.submit(frame)
+    return {"accepted": True, "camera_id": frame.camera_id}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1756,7 +1871,7 @@ def index() -> str:
             const data = await response.json();
             const metrics = data.metrics || {};
             document.getElementById('status').textContent =
-              `${data.status} | ${metrics.fps || 0} fps | ${metrics.sam_ms || 0}ms SAM`;
+              data.status + (metrics.camera_id ? ' | camera ' + metrics.camera_id : '') + ' | ' + (metrics.fps || 0) + ' fps | ' + (metrics.sam_ms || 0) + 'ms SAM';
           } catch (error) {
             document.getElementById('status').textContent = 'status unavailable';
           }
@@ -1796,4 +1911,14 @@ def stream() -> StreamingResponse:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    parser = argparse.ArgumentParser(description="RealSense pointing and SAM UI")
+    parser.add_argument("--api", action="store_true", help="receive aligned RGB-D frames over HTTP instead of opening a local RealSense")
+    parser.add_argument("--camera-id", help="accept frames only from this remote camera ID (requires --api)")
+    parser.add_argument("--host", default="0.0.0.0", help="HTTP listen address")
+    parser.add_argument("--port", type=int, default=8000, help="HTTP listen port")
+    args = parser.parse_args()
+    if args.camera_id and not args.api:
+        parser.error("--camera-id requires --api")
+    api_mode = args.api
+    expected_camera_id = args.camera_id
+    uvicorn.run(app, host=args.host, port=args.port)

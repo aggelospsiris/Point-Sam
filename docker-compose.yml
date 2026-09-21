@@ -11,7 +11,7 @@ services:
     privileged: true
     runtime: nvidia
     ports:
-      - "8001:8000"
+      - "${HOST_BIND:-127.0.0.1}:8001:8000"
     environment:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -120,4 +120,4 @@ services:
       - ./models/huggingface:/root/.cache/huggingface
     devices:
       - /dev/bus/usb:/dev/bus/usb
-    command: python -m sam_pointing_demo
+    command: python -m sam_pointing_demo ${APP_FLAGS:-}
