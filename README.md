@@ -17,7 +17,7 @@ There is no object detector, no object classes, no candidate boxes, and no VLM s
 First accept the gated SAM3 model terms on Hugging Face and export a token, then build:
 
 ```bash
-cd /home/sgeorgiou/point/sam_point
+cd /path/to/sam_point
 export HF_TOKEN=hf_your_token_here
 docker compose build --no-cache
 docker compose up
@@ -52,7 +52,7 @@ https://huggingface.co/facebook/sam3
 Then create a Hugging Face token and build with it:
 
 ```bash
-cd /home/sgeorgiou/point/sam_point
+cd /path/to/sam_point
 export HF_TOKEN=hf_your_token_here
 docker compose build --no-cache
 docker compose up
@@ -75,29 +75,50 @@ If the token is missing, expired, or you have not accepted the model terms, the 
 
 ## Remote RealSense over SSH
 
-Run the SAM server on the GPU machine in API mode. This mode waits for camera frames and does not open a local RealSense:
+### 1. Start the server on pc2
+
+After building the image as described above, start API mode on the GPU machine:
 
 ~~~bash
 HOST_BIND=127.0.0.1 APP_FLAGS=--api docker compose up
 ~~~
 
-The UI and upload API share port 8001. On the PC connected to the RealSense, create a local SSH tunnel to the server:
+API mode waits for uploaded frames instead of opening a local RealSense. In a second terminal on pc2, check that it is listening:
 
 ~~~bash
-ssh -N -L 8001:127.0.0.1:8001 user@server
+curl http://127.0.0.1:8001/status
 ~~~
 
-In another terminal on that camera PC, install the sender dependencies and start sending aligned RGB-D frames:
+The UI and frame upload API share port 8001. Docker Compose binds that port to pc2's loopback address, so a camera on another PC needs an SSH tunnel.
+
+### 2. Connect the camera PC
+
+If the RealSense and sender are on pc2, skip the SSH tunnel. Otherwise, run this on the PC connected to the RealSense:
 
 ~~~bash
+ssh -fN -o ExitOnForwardFailure=yes -L 8001:127.0.0.1:8001 user@pc2
+curl http://127.0.0.1:8001/status
+~~~
+
+Replace user@pc2 with your SSH login. The -fN options keep the tunnel running in the background. If you use ssh -N without -f, leave that terminal open and run the sender in a different terminal. Pressing Ctrl+C closes a foreground tunnel.
+
+### 3. Send aligned color and depth
+
+On the camera PC, in a checkout of this repository, install the small sender environment and start the sender:
+
+~~~bash
+python3 -m venv ~/realsense-sender-venv
+. ~/realsense-sender-venv/bin/activate
 python -m pip install -r sender-requirements.txt
 python remote_realsense_sender.py
 ~~~
 
-The sender uses http://127.0.0.1:8001/api/frames by default, sends up to 10 frames per second, and uses the RealSense serial as its camera ID. Copy remote_realsense_sender.py, frame_transport.py, and sender-requirements.txt to the camera PC if this repository is not there. The server runs hand tracking, pointing, and SAM, then publishes the result to the existing UI at http://127.0.0.1:8001.
+If the repository is not on the camera PC, copy remote_realsense_sender.py, frame_transport.py, and sender-requirements.txt there first. The sender uses http://127.0.0.1:8001/api/frames by default and sends up to 10 frames per second. It aligns depth to color before uploading and uses the RealSense serial as its camera ID.
 
-To view the UI from another PC, make the same SSH tunnel on that PC and open http://127.0.0.1:8001 in its browser. If you view it on the camera PC, its existing tunnel is enough.
+Open http://127.0.0.1:8001 in a browser on the camera PC to view the processed stream. On another viewing PC, create the same SSH tunnel there and open that address. The server runs hand tracking, pointing, and SAM, then publishes the overlay to the UI.
 
-To accept only one named camera, start the server with APP_FLAGS="--api --camera-id CAMERA_ID" and use --camera-id CAMERA_ID on the sender. The camera ID also appears in /status metrics. The upload endpoint accepts a binary POST containing a JPEG color frame, lossless 16-bit PNG depth frame, depth scale, and color intrinsics. Both frames must already be aligned; the included sender handles that. The upload endpoint is available only with --api.
+To accept only one named camera, start the server with APP_FLAGS="--api --camera-id CAMERA_ID" and use --camera-id CAMERA_ID on the sender. The camera ID appears in the UI and /status metrics. The upload endpoint accepts a binary POST containing a JPEG color frame, lossless 16-bit PNG depth frame, depth scale, and color intrinsics. It is available only in --api mode.
 
-Without Docker, start the server with python -m sam_pointing_demo --api --host 127.0.0.1 --port 8001 after installing the server dependencies and model. For a different sender URL, pass --url http://127.0.0.1:PORT/api/frames.
+If the sender reports "Connection refused", check /status on pc2 first, then on the camera PC. The latter must work before starting the sender. For a different local tunnel port, pass --url http://127.0.0.1:PORT/api/frames to the sender.
+
+Without Docker, start the server with python -m sam_pointing_demo --api --host 127.0.0.1 --port 8001 after installing the server dependencies and model.
