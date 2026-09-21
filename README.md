@@ -29,6 +29,48 @@ Open:
 http://localhost:8001
 ```
 
+## Render a recorded RealSense bag to MP4
+
+Pass a `.bag` recording to the included helper. It starts the finite
+`sam-pointing-video` container, mounts only the bag's parent directory, and
+exits when rendering is complete:
+
+```bash
+./run_rosbag.sh /absolute/path/to/capture.bag
+```
+
+The output is written beside the recording as:
+
+```text
+/absolute/path/to/capture_pointing_sam.mp4
+```
+
+To choose the filename or intentionally replace an existing output:
+
+```bash
+./run_rosbag.sh /absolute/path/to/capture.bag annotated.mp4 --overwrite
+```
+
+The batch service reuses the live service's hand tracking, aligned RGB-D
+pointing ray, SAM configuration, and overlay drawing. It reads the color and
+depth streams directly from the bag, keeps the recording's color FPS, and
+does not need a physical RealSense camera attached. The first run builds the
+same gated SAM3 image, so export `HF_TOKEN` as in the live setup.
+
+If you prefer to invoke Compose directly, mount the directory containing the
+bag and use container paths for the input and output:
+
+```bash
+ROSBAG_DIR=/absolute/path/to \
+ROSBAG_PATH=/recording/capture.bag \
+VIDEO_OUTPUT=/recording/capture_pointing_sam.mp4 \
+docker compose --profile video run --rm --build sam-pointing-video
+```
+
+`mp4v` is the default MP4 codec. If a downstream player requires H.264 and
+your OpenCV build supports it, set `BAG_VIDEO_CODEC=avc1` before running the
+helper or Compose command.
+
 ## SAM3 Checkpoint
 
 This project now uses the official local SAM3 checkpoint repo:
